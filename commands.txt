@@ -1,0 +1,4 @@
+echo "+uvm_ctrl" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+sudo mkdir soham_cgroup
+
+echo $$ | sudo tee /sys/fs/cgroup/test_uvm/cgroup.procs
