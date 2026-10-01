@@ -115,6 +115,13 @@ module_param(uvm_perf_fault_max_throttle_per_service, uint, S_IRUGO);
 static unsigned uvm_perf_fault_coalesce = 1;
 module_param(uvm_perf_fault_coalesce, uint, S_IRUGO);
 
+// When non-zero, tier-based fault deferral is skipped if all processes in
+// the current batch share the same pf_tier (i.e. no real priority contention).
+// When zero (default), tier deferral always applies strictly — a process in
+// tier 0 always waits, even if it is the only process running.
+static unsigned uvm_perf_fault_pf_tier_optimize = 0;
+module_param(uvm_perf_fault_pf_tier_optimize, uint, S_IRUGO);
+
 // This function is used for both the initial fault buffer initialization and
 // the power management resume path.
 static void fault_buffer_reinit_replayable_faults(uvm_parent_gpu_t *parent_gpu)
@@ -2284,6 +2291,41 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
     ats_invalidate->tlb_batch_pending = false;
 
+    // Determine whether multiple distinct pf_tiers are active in this batch
+    // If all processes share the same tier or there is only a single process,
+    // there is no priority contention and tier-based deferral would only waste
+    // batch slots, so we skip it entirely
+    // This optimisation is only active when uvm_perf_fault_pf_tier_optimize != 0.
+
+    // when uvm_perf_fault_pf_tier_optimize is disabled, it will always cause tiering
+    // else we go in the block to check for multiple tiers or multiple processes
+    // if not multi tier or multi process, it will skip tiering
+    bool multi_tier_active = (uvm_perf_fault_pf_tier_optimize == 0);
+    if (uvm_perf_fault_pf_tier_optimize != 0) // optimization enabled, but still check if conditions are met
+    {
+        uvm_gpu_id_t gpu_id = uvm_gpu_id_from_parent_gpu_id(parent_gpu->id);
+        u64 first_tier = (u64)-1;
+        NvU32 j;
+        for (j = 0; j < batch_context->num_coalesced_faults; j++) 
+        {
+            uvm_fault_buffer_entry_t *entry = batch_context->ordered_fault_cache[j];
+            
+            if (entry->va_space == NULL || entry->va_space->parent_cgp == NULL)
+                continue;
+            
+            u64 tier = entry->va_space->parent_cgp->gpu[gpu_id.val].pf_tier;
+            if (first_tier == (u64)-1) 
+            {
+                first_tier = tier;
+            } 
+            else if (tier != first_tier) 
+            {
+                multi_tier_active = true;
+                break;
+            }
+        }
+    }
+
     for (i = 0; i < batch_context->num_coalesced_faults;) {
         NvU32 block_faults;
         uvm_fault_buffer_entry_t *current_entry = batch_context->ordered_fault_cache[i];
@@ -2292,18 +2334,38 @@ static NV_STATUS service_fault_batch(uvm_parent_gpu_t *parent_gpu,
 
         UVM_ASSERT(current_entry->va_space);
 
-        // Skip faults for lower-priority cgroups in early batches
-        if (current_entry->va_space->parent_cgp != NULL) 
+        // Skip faults for lower-priority cgroups in early batches  only
+        // when multiple distinct tiers are actually competing, if all processes
+        // are in the same tier (including the single-process case), tiering
+        // adds no value and every batch should be served immediately
+        //
+        // Tier access is percentage-based using uvm_perf_fault_max_batches_per_service (M):
+        // Tier 3 (100%): served in all batches (never skipped)
+        // Tier 2 (75%): skipped in first 25% of batches (batch <= M*25/100)
+        // Tier 1 (50%): skipped in first 50% of batches (batch <= M*50/100)
+        // Tier 0 (25%): skipped in first 75% of batches (batch <= M*75/100)
+        if (multi_tier_active && current_entry->va_space->parent_cgp != NULL)
         {
             uvm_gpu_id_t gpu_id = uvm_gpu_id_from_parent_gpu_id(parent_gpu->id);
             u64 tier = current_entry->va_space->parent_cgp->gpu[gpu_id.val].pf_tier;
-            if ((tier == 0 && batch_number <= 15) || (tier == 1 && batch_number <= 10))
+            unsigned max_batches = uvm_perf_fault_max_batches_per_service;
+            // Threshold = number of early batches during which this tier is deferred
+            // A tier with X% access is deferred for the first (100-X)% of batches
+            unsigned skip_threshold;
+            switch (tier) 
+            {
+            case 0:  skip_threshold = max_batches * 75 / 100; break; // 25% access
+            case 1:  skip_threshold = max_batches * 50 / 100; break; // 50% access
+            case 2:  skip_threshold = max_batches * 25 / 100; break; // 75% access
+            default: skip_threshold = 0;                      break; // tier 3 100% access
+            }
+            if (batch_number <= skip_threshold) 
             {
                 ++i;
                 continue;
             }
         }
-        // tier 2 (or no cgroup) is highest priority, served in all batches
+        // tier 3 (or no cgroup) has highest priority and is served in all batches
 
 
         if (current_entry->va_space != va_space) {
